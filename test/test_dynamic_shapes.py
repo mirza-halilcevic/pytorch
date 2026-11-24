@@ -2,10 +2,12 @@
 # ruff: noqa: F841
 import contextlib
 import copy
+import gc
 import itertools
 import math
 import operator
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -1914,6 +1916,31 @@ Ne(Eq(u1, 1), Eq(u0, 1))""",
             raise AssertionError(f"expected a0 < 4, got a0={a0}")
         new_shape_env = copy.deepcopy(shape_env)
         self.assertEqual(len(new_shape_env.guards), 1)
+
+    def test_deepcopy_does_not_share_method_caches(self):
+        shape_env = ShapeEnv()
+        a0 = create_symint(shape_env, 2)
+        if not (a0 < 4):
+            raise AssertionError(f"expected a0 < 4, got a0={a0}")
+        self.assertGreater(shape_env._cached_evaluate_expr.cache_info().currsize, 0)
+
+        new_shape_env = copy.deepcopy(shape_env)
+        self.assertIsNot(
+            new_shape_env._cached_evaluate_expr, shape_env._cached_evaluate_expr
+        )
+        self.assertEqual(new_shape_env._cached_evaluate_expr.cache_info().currsize, 0)
+
+    def test_method_caches_do_not_keep_shape_env_alive(self):
+        shape_env = ShapeEnv()
+        a0 = create_symint(shape_env, 2)
+        if not (a0 < 4):
+            raise AssertionError(f"expected a0 < 4, got a0={a0}")
+        self.assertGreater(shape_env._cached_evaluate_expr.cache_info().currsize, 0)
+
+        shape_env_ref = weakref.ref(shape_env)
+        del shape_env, a0
+        gc.collect()
+        self.assertIsNone(shape_env_ref())
 
     def test_print_readable_with_symints(self):
         def f(a, b):

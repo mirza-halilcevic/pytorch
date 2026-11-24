@@ -32,6 +32,7 @@ import re
 import sys
 import threading
 import traceback
+import weakref
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import _GeneratorContextManager, contextmanager
@@ -2765,17 +2766,148 @@ SYMPY_INTERP = {
 }
 
 
+class _ShapeEnvCachedMethod(Generic[_T]):
+    """lru_cache for a ShapeEnv method, with a separate cache per ShapeEnv.
+
+    A class-level lru_cache keys on self, so it keeps every ShapeEnv that ever
+    called the method alive. This descriptor builds the cache on first access
+    and stores it in the instance __dict__ under the method's name, so later
+    lookups skip the descriptor. The cache refers back to its ShapeEnv only
+    through a weakref, so it does not keep the ShapeEnv alive either.
+    """
+
+    def __init__(
+        self,
+        fn: Callable[..., _T],
+        maxsize: int | None,
+        invalidate_on: str | None,
+    ) -> None:
+        if invalidate_on not in (None, "version", "replacements_and_ranges"):
+            raise AssertionError(f"unknown invalidate_on: {invalidate_on}")
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.maxsize = maxsize
+        self.invalidate_on = invalidate_on
+        self.name = fn.__name__
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+        owner._cached_method_names = getattr(  # type: ignore[attr-defined]
+            owner, "_cached_method_names", frozenset()
+        ) | {name}
+
+    @overload
+    def __get__(
+        self, env: None, owner: type | None = None
+    ) -> _ShapeEnvCachedMethod[_T]: ...
+
+    @overload
+    def __get__(
+        self, env: ShapeEnv, owner: type | None = None
+    ) -> functools._lru_cache_wrapper[_T]: ...
+
+    def __get__(
+        self, env: ShapeEnv | None, owner: type | None = None
+    ) -> _ShapeEnvCachedMethod[_T] | functools._lru_cache_wrapper[_T]:
+        if env is None:
+            return self
+        cached = self._bind(env)
+        env.__dict__[self.name] = cached
+        return cached
+
+    def _bind(self, env: ShapeEnv) -> functools._lru_cache_wrapper[_T]:
+        fn = self.fn
+        env_ref = weakref.ref(env)
+
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> _T:
+            return fn(env_ref(), *args, **kwargs)
+
+        fn_cache = functools.lru_cache(self.maxsize)(call)
+        if self.invalidate_on is None:
+            return fn_cache
+
+        prior_version = 0
+        prior_range_version = 0
+
+        # Separate wrappers keep the hot path a direct attribute read.
+        if self.invalidate_on == "replacements_and_ranges":
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> _T:
+                nonlocal prior_version, prior_range_version
+                env = env_ref()
+                if (
+                    prior_version != env._replacements_version_counter
+                    or prior_range_version != env._var_to_range_version_counter
+                ):
+                    fn_cache.cache_clear()
+                    prior_version = env._replacements_version_counter
+                    prior_range_version = env._var_to_range_version_counter
+
+                return fn_cache(*args, **kwargs)
+
+        elif config.validate_shape_env_version_key:
+            prior_key = None
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> _T:
+                nonlocal prior_version, prior_key
+                env = env_ref()
+                if prior_key is None:
+                    prior_key = env._get_key()
+
+                if prior_version != env._version_counter:
+                    fn_cache.cache_clear()
+                    prior_version = env._version_counter
+                    prior_key = env._get_key()
+                else:
+                    if prior_key != env._get_key():
+                        raise AssertionError(
+                            "ShapeEnv cache key changed without version being updated!"
+                        )
+
+                return fn_cache(*args, **kwargs)
+
+        else:
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> _T:
+                nonlocal prior_version
+                env = env_ref()
+                if prior_version != env._version_counter:
+                    fn_cache.cache_clear()
+                    prior_version = env._version_counter
+
+                return fn_cache(*args, **kwargs)
+
+        wrapper.cache_clear = fn_cache.cache_clear  # type: ignore[attr-defined]
+        wrapper.cache_info = fn_cache.cache_info  # type: ignore[attr-defined]
+        return wrapper  # type: ignore[return-value]
+
+
+def _method_lru_cache(
+    maxsize: int | None,
+) -> Callable[[Callable[..., _T]], _ShapeEnvCachedMethod[_T]]:
+    """Plain lru_cache for a ShapeEnv method, with a separate cache per ShapeEnv."""
+
+    def inner(fn: Callable[..., _T]) -> _ShapeEnvCachedMethod[_T]:
+        return _ShapeEnvCachedMethod(fn, maxsize, None)
+
+    return inner
+
+
 def _lru_cache(
     fn: Callable[..., _T],
     maxsize: int | None = None,
     *,
     replacements_and_ranges: bool = False,
-) -> functools._lru_cache_wrapper[_T]:
+) -> _ShapeEnvCachedMethod[_T]:
     """
     Wrapper around lru_cache that clears when new info about shapes has been
     updated.
 
-    Use plain lru_cache only if the result for the same arguments can never
+    Use _method_lru_cache only if the result for the same arguments can never
     change as the ShapeEnv gains constraints. For example, if evaluate_expr
     returns True and installs a guard requiring the condition to hold, all
     later reasoning must respect that guard, so the answer stays True.
@@ -2803,61 +2935,11 @@ def _lru_cache(
     _get_key() changed; it is not an unconditional bump. Calling it after an
     arbitrary mutation does not guarantee invalidation.
     """
-    fn_cache = lru_cache(maxsize)(fn)
-    prior_version = 0
-    prior_range_version = 0
-
-    # Separate wrappers keep the hot path a direct attribute read.
-    if replacements_and_ranges:
-
-        @functools.wraps(fn)
-        def wrapper(self: ShapeEnv, *args: Any, **kwargs: Any) -> _T:  # type: ignore[misc]
-            nonlocal prior_version, prior_range_version
-            if (
-                prior_version != self._replacements_version_counter
-                or prior_range_version != self._var_to_range_version_counter
-            ):
-                fn_cache.cache_clear()
-                prior_version = self._replacements_version_counter
-                prior_range_version = self._var_to_range_version_counter
-
-            return fn_cache(self, *args, **kwargs)
-
-    elif config.validate_shape_env_version_key:
-        prior_key = None
-
-        @functools.wraps(fn)
-        def wrapper(self: ShapeEnv, *args: Any, **kwargs: Any) -> _T:
-            nonlocal prior_version, prior_key
-            if prior_key is None:
-                prior_key = self._get_key()
-
-            if prior_version != self._version_counter:
-                fn_cache.cache_clear()
-                prior_version = self._version_counter
-                prior_key = self._get_key()
-            else:
-                if prior_key != self._get_key():
-                    raise AssertionError(
-                        "ShapeEnv cache key changed without version being updated!"
-                    )
-
-            return fn_cache(self, *args, **kwargs)
-
-    else:
-
-        @functools.wraps(fn)
-        def wrapper(self: ShapeEnv, *args: Any, **kwargs: Any) -> _T:  # type: ignore[misc]
-            nonlocal prior_version
-            if prior_version != self._version_counter:
-                fn_cache.cache_clear()
-                prior_version = self._version_counter
-
-            return fn_cache(self, *args, **kwargs)
-
-    wrapper.cache_clear = fn_cache.cache_clear  # type: ignore[attr-defined]
-    wrapper.cache_info = fn_cache.cache_info  # type: ignore[attr-defined]
-    return wrapper  # type: ignore[return-value]
+    return _ShapeEnvCachedMethod(
+        fn,
+        maxsize,
+        "replacements_and_ranges" if replacements_and_ranges else "version",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4485,6 +4567,15 @@ class ShapeEnv:
             self._bump_replacements_version()
             self.frozen = False
 
+    # Filled in by _ShapeEnvCachedMethod.__set_name__.
+    _cached_method_names: frozenset[str]
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Method caches point at this ShapeEnv; a copy builds its own.
+        return {
+            k: v for k, v in self.__dict__.items() if k not in self._cached_method_names
+        }
+
     def check_equal(self, other: ShapeEnv) -> None:
         """Compare another ShapeEnv for equivalence"""
         # ShapeEnv fields that are not relevant for the outcome of
@@ -4526,6 +4617,7 @@ class ShapeEnv:
             # Foreign ShapeEnv transfer cache; replay reconstructs equivalent
             # transferred symbols through recorded registration events.
             "foreign_unbacked_symbol_cache",
+            *self._cached_method_names,
         )
 
         # Mapping of the value of each to-be-compared field into the values that
@@ -7365,7 +7457,7 @@ class ShapeEnv:
             )
         return tuple(dict.fromkeys(axioms).keys())
 
-    @lru_cache(None)
+    @_method_lru_cache(None)
     def get_implications(
         self, e: SympyBoolean
     ) -> tuple[tuple[SympyBoolean, sympy.logic.boolalg.BooleanAtom], ...]:
@@ -7909,7 +8001,6 @@ class ShapeEnv:
         "use guarding_hint_or_throw or optimization_hint instead",
         category=FutureWarning,
     )
-    @lru_cache(256)
     def size_hint(
         self, expr: sympy.Basic, *, allow_none: bool = False
     ) -> sympy.Basic | None:
@@ -7918,6 +8009,12 @@ class ShapeEnv:
         Does not introduce a guard, so only use this when you can guarantee that
         your code is still valid for arbitrary shapes (such as optimization decisions)
         """
+        return self._size_hint(expr, allow_none=allow_none)
+
+    @_method_lru_cache(256)
+    def _size_hint(
+        self, expr: sympy.Basic, *, allow_none: bool = False
+    ) -> sympy.Basic | None:
         result_expr = safe_expand(expr).xreplace(self.backed_var_to_val)
         if not result_expr.is_number:
             from torch.utils._sympy.singleton_int import SingletonInt
@@ -7955,7 +8052,7 @@ class ShapeEnv:
             raise self._make_data_dependent_error(result_expr, expr)
         return result_expr
 
-    @lru_cache(256)
+    @_method_lru_cache(256)
     def guarding_hint_or_throw(self, expr: sympy.Expr | int) -> int | bool | float:
         """
         Return a concrete hint for an expression.
@@ -7965,7 +8062,7 @@ class ShapeEnv:
         """
         return _guarding_hint_or_throw_base(self, expr, {})
 
-    @lru_cache(256)
+    @_method_lru_cache(256)
     def has_guarding_hint(self, expr: sympy.Expr) -> bool:
         try:
             self.guarding_hint_or_throw(expr)
@@ -8349,7 +8446,7 @@ class ShapeEnv:
             self._set_replacement(a, replaced, "find")
         return self.replacements[a]
 
-    @lru_cache(256)
+    @_method_lru_cache(256)
     def _maybe_guard_rel(self, expr: sympy.Expr) -> None:
         """
         The relational guard is guarded to be true.  Use this information to
@@ -8890,7 +8987,7 @@ class ShapeEnv:
             self._log_suppressed_dde(orig_expr, fallback_value)
             return fallback_value
 
-    @lru_cache(256)
+    @_method_lru_cache(256)
     def _cached_evaluate_expr(
         self,
         orig_expr: sympy.Basic,
@@ -9294,7 +9391,7 @@ class ShapeEnv:
                 return True
         return False
 
-    @lru_cache(256)
+    @_method_lru_cache(256)
     @record_shapeenv_event(save_tracked_fakes=True)
     def guard_or_defer_runtime_assert(
         self, orig_expr: SympyBoolean, msg: str, fx_node: torch.fx.Node | None = None
@@ -9472,7 +9569,7 @@ class ShapeEnv:
                     "range_refined_to_singleton",
                 )
 
-    @lru_cache(maxsize=None)
+    @_method_lru_cache(maxsize=None)
     @record_shapeenv_event()
     def constrain_symbol_range(
         self, s: sympy.Symbol, compiler_min: int, compiler_max: int

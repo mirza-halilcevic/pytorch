@@ -465,7 +465,7 @@ class _ShapeEnvPickleData:
         # pointing at the same ShapeEnv get the same ShapeEnv out).
         if env._translation_validation_enabled:
             raise AssertionError("Translation validation must be disabled for pickling")
-        self.data = env.__dict__.copy()
+        self.data = env.__getstate__()
         del self.data["tracked_fakes"]
         del self.data["fake_tensor_cache"]
 
