@@ -235,22 +235,28 @@ def clear_compile_context_weakrefs(
     compiler_fn: CompilerFn,
 ) -> None:
     """Clear compile-context references that can retain tensors after compile."""
-    should_clear = config.invalidate_compile_context_weakrefs
-    if should_clear is None:
-        should_clear = _is_registered_backend(innermost_backend(compiler_fn))
-    if not should_clear or not tracer_output:
+    if not tracer_output:
         return
     # Use output_graph_for_cleanup which is set even on error paths
     # (output_graph is None when the compilation errored).
     output_graph = tracer_output.output_graph_for_cleanup
     if output_graph is None:
         return
+    # The ShapeEnv outlives compile, and the tracked FakeTensors hold SymInts
+    # that point back to it from C++, so gc cannot free this cycle. Guards are
+    # already built, so clear it for every backend.
+    output_graph.tracked_fakes.clear()
+
+    should_clear = config.invalidate_compile_context_weakrefs
+    if should_clear is None:
+        should_clear = _is_registered_backend(innermost_backend(compiler_fn))
+    if not should_clear:
+        return
     tc = output_graph.tracing_context
     tc.tensor_to_context.clear()
     _clear_fake_mode_weakrefs(tc.fake_mode)
     if hasattr(output_graph, "_old_fake_mode"):
         _clear_fake_mode_weakrefs(output_graph._old_fake_mode)
-    output_graph.tracked_fakes.clear()
 
 
 class Tracker:

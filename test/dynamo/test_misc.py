@@ -8553,6 +8553,30 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         del x
         self.assertTrue(p_ref() is None)
 
+    def test_custom_backend_releases_tracked_fakes(self):
+        fake_refs = []
+
+        def backend(gm, example_inputs):
+            shape_env = torch._guards.TracingContext.get().fake_mode.shape_env
+            fake_refs.extend(
+                weakref.ref(tf.fake)
+                for tf in shape_env.tracked_fakes
+                if isinstance(tf.fake, torch.Tensor)
+            )
+            return gm.forward
+
+        # Without dynamic shapes there are no SymInts, so no cycle to leak.
+        @torch.compile(backend=backend, dynamic=True)
+        def f(x):
+            return x * 2
+
+        f(torch.randn(4))
+
+        self.assertTrue(fake_refs)
+        torch._dynamo.reset()
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in fake_refs))
+
     @skipIfWindows(msg="Tensor lifetime checks are unreliable on Windows")
     def test_release_input_memory_hop_dunder_dict(self):
         # Accessing a nested function's __dict__ inside a HOP body used to
